@@ -14,6 +14,11 @@
  * ------------------------------------------------------------------------
  * Revision : 
  *  - 2017-jan-08 0.1 initial version 
+ *  - 2017-jan-12 0.2 added A/B (split in next version??) 2 pins used
+ *                    to select VFOA or VFOB, pull down to select. When
+ *                    both low VFOA wins. when both high VFOB wins. Why
+ *                    2 pins? because in next release maybe split 
+ *                    (VFOA = RX, VFOB = TX) will be added. 
  * ------------------------------------------------------------------------
  * Hardware used : 
  *  - Arduino NANO  
@@ -57,9 +62,10 @@ int_fast32_t prevtimepassed = millis(); // int to hold the arduino miilis since 
 // define the band
 uint32_t FreqLowerLimit = (uint32_t)7000e3; // lower limit acording to band plan
 uint32_t FreqUpperLimit = (uint32_t)7200e3; // upper limit according to bandplan
-uint32_t FreqBase = (uint32_t)7000e3; // the base frequency (first full 500Khz block from FreqLowerLimit)
-uint32_t Freq = (uint32_t)7100e3 ; // the current frequency on that band (set with default) 
- 
+uint32_t FreqBase = (uint32_t)7000e3; // the base frequency  
+uint32_t FreqVFOA = (uint32_t)7100e3 ; // the A frequency (set with default) 
+uint32_t FreqVFOB = (uint32_t)7150e3 ; // the B frequency (set with default)  
+uint32_t Freq = FreqVFOA;  // default
 
 // define the stepstruct
 typedef struct 
@@ -74,11 +80,11 @@ typedef enum
 {
   STEPMIN = 0,
   S10 = 0,
-  S25 = 1,
+  S50 = 1,
   S100 = 2,
-  S250 = 3,
+  S500 = 3,
   S1KHZ = 4,
-  S2_5KHZ = 5,
+  S5KHZ = 5,
   S10KHZ = 6,
   STEPMAX = 6
 } 
@@ -88,24 +94,26 @@ StepEnum;
 StepStruct  Steps [] =
 {
   { (char *)"10Hz", 10 }, 
-  { (char *)"25Hz", 25 }, 
+  { (char *)"50Hz", 50 }, 
   { (char *)"100Hz", 100 }, 
-  { (char *)"250Hz", 250 }, 
+  { (char *)"500Hz", 500 }, 
   { (char *)"1KHz", 1000 }, 
-  { (char *)"2.5KHz", 2500 }, 
+  { (char *)"5KHz", 5000 }, 
   { (char *)"10KHz", 10000 }
 };
 
 // Switching band stuff
 boolean switchBand = false; 
-int currentFreqStepIndex = (int)S250; // default 10Hz.
+int currentFreqStepIndex = (int)S100; // default 100Hz.
 
 // Encoder stuff
 int encoder0PinALast = LOW; 
 #define encoderPin1 2
 #define encoderPin2 3
+// #define pttSW   4  SPLIT SUPPORT NOT USED YET.
+#define vfoASW 5
+#define vfoBSW 6 
 #define encoderSW 7
-#define disableLed 6 
 
 volatile int lastEncoded = 0;
 volatile long encoderValue = 0;
@@ -118,22 +126,16 @@ int nrOfSteps = 0;
 // LCD stuff
 boolean updatedisplayfreq = false;
 boolean updatedisplaystep = false;
-
-boolean useLed = true;
+ 
+boolean useVFOA = false;
+boolean useVFOB = false;
 
 // Playtime
 void setup() 
 { 
   
   debugSerial.begin(57600); 
-  debugPrintLn(F("setup"));
-  
-  pinMode(disableLed, INPUT);
-  digitalWrite(disableLed, HIGH); //turn pullup resistor on
-  useLed = digitalRead(disableLed);
-
-  debugPrint(F("useled = "));  
-  debugPrintLn(useLed);  
+  debugPrintLn(F("setup"));  
   
   SPI.begin();  
   SPI.setDataMode(SPI_MODE2);   
@@ -149,16 +151,12 @@ void setup()
   /* Set the brightness to a medium values */
   lc.setIntensity(0,6);
   /* and clear the display */
-  lc.clearDisplay(0);  
-  
-  debugPrintLn(F("led done"));  
-  
-  writeTextToLed("DDS");
-  //delay(1000); 
+  lc.clearDisplay(0);   
+  debugPrintLn(F("led done"));   
+  writeTextToLed("DDS"); 
   ad9833.init();
   ad9833.reset(); 
-  writeTextToLed("initdone");
-  //delay(1000); 
+  writeTextToLed("initdone"); 
   updatedisplayfreq = true;
   updatedisplaystep = false;
   
@@ -170,10 +168,16 @@ void setup()
   pinMode(encoderPin1, INPUT); 
   pinMode(encoderPin2, INPUT);
   pinMode(encoderSW, INPUT);
+  // pinMode(pttSW, INPUT); NOT USED YET.
+  pinMode(vfoASW, INPUT);
+  pinMode(vfoBSW, INPUT); 
 
   digitalWrite(encoderPin1, HIGH); //turn pullup resistor on
   digitalWrite(encoderPin2, HIGH); //turn pullup resistor on
   digitalWrite(encoderSW, HIGH); //turn pullup resistor on
+  // digitalWrite(pttSW, HIGH); //turn pullup resistor on NOT USED YET.
+  digitalWrite(vfoASW, HIGH); //turn pullup resistor on
+  digitalWrite(vfoBSW, HIGH); //turn pullup resistor on
   
   //call updateEncoder() when any high/low changed seen
   //on interrupt 0 (pin 2), or interrupt 1 (pin 3) 
@@ -181,8 +185,9 @@ void setup()
   attachInterrupt(1, updateEncoder, CHANGE);
 } 
 
-
-void updateEncoder(){
+// INT0 and INT1 interrupt handler routine (used for encoder)
+void updateEncoder()
+{
   int MSB = digitalRead(encoderPin1); //MSB = most significant bit
   int LSB = digitalRead(encoderPin2); //LSB = least significant bit
 
@@ -195,10 +200,10 @@ void updateEncoder(){
   lastEncoded = encoded; //store this value for next time
 }
 
-// function to set the AD9850 to the VFO frequency depending on bandplan.
+// function to set the AD9833 to the VFO frequency depending on bandplan.
 void setFreq()
 {
-  // now we know what we want, so scale it back to the 5Mhz - 5.5Mhz freq
+  // now we know what we want, so scale it back to the 4.8Mhz - 5Mhz freq
   uint32_t frequency = Freq - FreqBase;
   uint32_t ft301freq = (vfofrequpperlimit - vfofreqlowerlimit) - frequency + vfofreqlowerlimit;
  
@@ -206,9 +211,7 @@ void setFreq()
 }
  
 void writeTextToLed(char *p)
-{
-  if (useLed)
-  {
+{ 
     lc.clearDisplay(0);
     lc.setChar(0, 0, p[7], false);
     lc.setChar(0, 1, p[6], false);
@@ -218,56 +221,48 @@ void writeTextToLed(char *p)
     lc.setChar(0, 5, p[2], false);  
     lc.setChar(0, 6, p[1], false);  
     lc.setChar(0, 7, p[0], false);   
-    delay ( 00 );
-  }
+    delay ( 00 ); 
 }
 
 void freqToLed( long v)
-{
-  if (useLed)
-  {
+{ 
      lc.clearDisplay(0);
-  
-    // Variable value digit 
-    int digito1;
+     // MAX 7.200.00  (no 1Hz) 
+     // Variable value digit 
+     int digito1;
      int digito2;
      int digito3;
      int digito4;
      int digito5;
      int digito6;
-     int digito7;
-     int digito8;
   
     // Calculate the value of each digit 
-    digito1 = v %  10 ;
-    digito2 = (v / 10 )% 10 ;
-    digito3 = (v / 100 )% 10 ;  
-    digito4 = (v / 1000 )% 10 ;
-    digito5 = (v / 10000 )% 10 ;
-    digito6 = (v / 100000 )% 10 ;
-    digito7 = (v / 1000000 )% 10 ;
-    digito8 = (v / 10000000 )% 10 ;
+    digito1 = (v / 10 )% 10 ;
+    digito2 = (v / 100 )% 10 ;  
+    digito3 = (v / 1000 )% 10 ;
+    digito4 = (v / 10000 )% 10 ;
+    digito5 = (v / 100000 )% 10 ;
+    digito6 = (v / 1000000 )% 10 ;
     
-    // Display the value of each digit in the display 
-    if (digito8 > 0)
-    {
-      lc.setDigit ( 0 , 7 , (byte) digito8, false);
-    }
-    lc.setDigit ( 0 , 6 , (byte) digito7, true);
+    // Display the value of each digit in the display   byte = point, A, B, C, D, E, G
+    if (useVFOA)
+      lc.setChar(0, 7, 'A', false); // or use A when you like
+    else if (useVFOB)
+      lc.setChar(0, 7, 'B', false); // or use B when you like
+    else  
+      lc.setChar(0, 7, 'S', false);
+
     lc.setDigit ( 0 , 5 , (byte) digito6, false);
     lc.setDigit ( 0 , 4 , (byte) digito5, false);
-    lc.setDigit ( 0 , 3 , (byte) digito4, true);
-    lc.setDigit ( 0 , 2 , (byte) digito3, false);
+    lc.setDigit ( 0 , 3 , (byte) digito4, false);
+    lc.setDigit ( 0 , 2 , (byte) digito3, true);
     lc.setDigit ( 0 , 1 , (byte) digito2, false);
     lc.setDigit ( 0 , 0 , (byte) digito1, false);
-    delay ( 00 );
-  }
+    delay ( 00 ); 
 } 
 
 void stepToLed( long s)
-{
-   if (useLed)
-    {
+{ 
     lc.clearDisplay(0);
     lc.setChar(0, 7, 's', false);
     lc.setChar(0, 6, 't', false);
@@ -304,18 +299,15 @@ void stepToLed( long s)
     }
     // there isn't anything smaller then 10
     lc.setDigit ( 0 , 1 , (byte) digito2, is10Kplus);
-    lc.setDigit ( 0 , 0 , (byte) digito1, false);
-  }
+    lc.setDigit ( 0 , 0 , (byte) digito1, false); 
 } 
  
 
-// function to update . . the LCD 
+// function to update the display
 void updateDisplays()
 {
   if (updatedisplayfreq)
   {
-    float freq = Freq / 1e3; // because we display Khz and the Freq is in Mhz.
- 
     freqToLed(Freq); 
   }
 
@@ -330,6 +322,8 @@ boolean ccw = false;
 boolean cw = false;
 boolean changeStep = false;
 boolean prevSw = false;
+boolean prevVFOASW = false;
+boolean prevVFOBSW = false;
 
 // the main loop
 void loop() 
@@ -343,16 +337,37 @@ void loop()
     nrOfSteps = (int)encoderValue / 4;
     encoderValue = 0; 
   } 
-  
-  boolean sw = digitalRead(encoderSW) == 0;
 
+  // read VFOA switch
+  useVFOA = digitalRead(vfoASW) == 0;
+  if (useVFOA != prevVFOASW)
+  {
+    prevVFOASW = useVFOA;
+    updatedisplayfreq = true;
+    updatefreq = true;
+  }
+  // read VFOB switch
+  useVFOB = digitalRead(vfoBSW) == 0; 
+  if (useVFOB != prevVFOBSW)
+  {
+    prevVFOBSW = useVFOB;
+    updatedisplayfreq = true; 
+    updatefreq = true;
+  }
+
+  // load the Freq variable.
+  Freq = FreqVFOA;  // default load VFO A
+  if (useVFOB)  // but when VFO B is used load FreqB
+    Freq = FreqVFOB;
+  
+  // read encoder switch 
+  boolean sw = digitalRead(encoderSW) == 0;
   if (sw != prevSw)
   {
      prevSw = sw;
      if (sw)
      {
-       changeStep = changeStep == 0; // toggle 
-       Serial.println(changeStep); 
+       changeStep = changeStep == 0; // toggle  
        if (changeStep)
          updatedisplaystep = true;
        else
@@ -384,6 +399,7 @@ void loop()
     }
     else
     {
+      // Freq is set already so save to use.    
       if (nrOfSteps > 0)
       {
         int nrOfStepsTmp = nrOfSteps; 
@@ -419,9 +435,13 @@ void loop()
 
   if (updatefreq)
   { 
+    if (useVFOA || (useVFOA == 0 && useVFOB == 0))   // when VFO A selected
+      FreqVFOA = Freq; // store current freq in FreqA
+    else if (useVFOB) // when VFO B selected
+      FreqVFOB = Freq; // store current freq in FreqB
+      
     setFreq();
   }
 
   updateDisplays();   
 }
-
