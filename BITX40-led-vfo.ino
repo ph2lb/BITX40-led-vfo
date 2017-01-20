@@ -19,6 +19,8 @@
  *                    both low VFOA wins. when both high VFOB wins. Why
  *                    2 pins? because in next release maybe split 
  *                    (VFOA = RX, VFOB = TX) will be added. 
+ *  - 2017-jan-17 0.3 better support for AB (remember step)
+ *                    added FreqOffset (see comment below)
  * ------------------------------------------------------------------------
  * Hardware used : 
  *  - Arduino NANO  
@@ -30,10 +32,8 @@
  *  - LedControl library from Eberhard Fahle
  * ------------------------------------------------------------------------ 
  * TODO LIST : 
- *  - add more sourcode comment
- *  - add debounce for the keys 
- *  - harden the rotary switch (sometimes strange behaviour due to timing
- *    isues (current no interrupt).
+ *  - add more sourcode comment 
+ *  - add freqoffset in eeprom
  * ------------------------------------------------------------------------ 
  */
  
@@ -66,6 +66,7 @@ uint32_t FreqBase = (uint32_t)7000e3; // the base frequency
 uint32_t FreqVFOA = (uint32_t)7100e3 ; // the A frequency (set with default) 
 uint32_t FreqVFOB = (uint32_t)7150e3 ; // the B frequency (set with default)  
 uint32_t Freq = FreqVFOA;  // default
+long FreqOffset =  -1500;   // You have to set Freq off set in Hz. because no BitX has the same crystals.
 
 // define the stepstruct
 typedef struct 
@@ -104,7 +105,9 @@ StepStruct  Steps [] =
 
 // Switching band stuff
 boolean switchBand = false; 
-int currentFreqStepIndex = (int)S100; // default 100Hz.
+int FreqStepIndex = (int)S100; // default 100Hz.
+int FreqStepIndexA = FreqStepIndex;
+int FreqStepIndexB = FreqStepIndex; 
 
 // Encoder stuff
 int encoder0PinALast = LOW; 
@@ -132,16 +135,13 @@ boolean useVFOB = false;
 
 // Playtime
 void setup() 
-{ 
-  
+{  
   debugSerial.begin(57600); 
   debugPrintLn(F("setup"));  
   
   SPI.begin();  
   SPI.setDataMode(SPI_MODE2);   
-  
   debugPrintLn(F("spi done"));  
- 
   lc.init();
   /*
   The MAX72XX is in power-saving mode on startup,
@@ -206,8 +206,8 @@ void setFreq()
   // now we know what we want, so scale it back to the 4.8Mhz - 5Mhz freq
   uint32_t frequency = Freq - FreqBase;
   uint32_t ft301freq = (vfofrequpperlimit - vfofreqlowerlimit) - frequency + vfofreqlowerlimit;
- 
-  ad9833.setFrequency((long)ft301freq); 
+  
+  ad9833.setFrequency((long)ft301freq + FreqOffset); 
 }
  
 void writeTextToLed(char *p)
@@ -313,7 +313,7 @@ void updateDisplays()
 
   if (updatedisplaystep)
   { 
-    stepToLed(Steps[currentFreqStepIndex].Step); 
+    stepToLed(Steps[FreqStepIndex].Step); 
   } 
 } 
 
@@ -359,7 +359,11 @@ void loop()
   Freq = FreqVFOA;  // default load VFO A
   if (useVFOB)  // but when VFO B is used load FreqB
     Freq = FreqVFOB;
-  
+  // load the FreqStepIndex variable.  
+  FreqStepIndex = FreqStepIndexA;  // default load VFO A
+  if (useVFOB)  // but when VFO B is used load FreqB
+    FreqStepIndex = FreqStepIndexB;
+        
   // read encoder switch 
   boolean sw = digitalRead(encoderSW) == 0;
   if (sw != prevSw)
@@ -384,18 +388,23 @@ void loop()
     if (changeStep)
     {
       int nrOfStepsTmp = nrOfSteps; 
-      nrOfSteps = 0;
-        
-      if (nrOfStepsTmp > 0 && currentFreqStepIndex < STEPMAX)
+      nrOfSteps = 0; 
+      
+      if (nrOfStepsTmp > 0 && FreqStepIndex < STEPMAX)
       {
-        currentFreqStepIndex = (StepEnum)currentFreqStepIndex + 1;
+        FreqStepIndex = (StepEnum)FreqStepIndex + 1;
         updatedisplaystep = true;
       } 
-      else if (nrOfStepsTmp < 0 && currentFreqStepIndex > STEPMIN)
+      else if (nrOfStepsTmp < 0 && FreqStepIndex > STEPMIN)
       {
-        currentFreqStepIndex = (StepEnum)currentFreqStepIndex - 1;
+        FreqStepIndex = (StepEnum)FreqStepIndex - 1;
         updatedisplaystep = true;
       } 
+
+      if (useVFOA || (useVFOA == 0 && useVFOB == 0))   // when VFO A selected
+        FreqStepIndexA = FreqStepIndex; // store current FreqStepIndex in FreqStepIndexA
+      else if (useVFOB) // when VFO B selected
+        FreqStepIndexB = FreqStepIndex; // store current FreqStepIndex in FreqStepIndexB  
     }
     else
     {
@@ -406,7 +415,7 @@ void loop()
         nrOfSteps = 0;
           if (Freq < FreqUpperLimit)
           {
-            Freq = Freq + (Steps[currentFreqStepIndex].Step * nrOfStepsTmp);
+            Freq = Freq + (Steps[FreqStepIndex].Step * nrOfStepsTmp);
             updatefreq = true;
             updatedisplayfreq = true;
           }
@@ -421,7 +430,7 @@ void loop()
         nrOfSteps = 0;
           if (Freq > FreqLowerLimit)
           {
-            Freq = Freq + (Steps[currentFreqStepIndex].Step * nrOfStepsTmp);
+            Freq = Freq + (Steps[FreqStepIndex].Step * nrOfStepsTmp);
             updatefreq = true;
             updatedisplayfreq = true;
           }
